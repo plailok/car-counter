@@ -34,7 +34,7 @@ exe = EXE(
     strip=False,
     upx=True,
     console=False,   # окно консоли не открывается
-    icon='icon.ico'  # можно добавить иконку
+    icon='icons/car-100.ico'  # можно добавить иконку
 )
 coll = COLLECT(
     exe,
