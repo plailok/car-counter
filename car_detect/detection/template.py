@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Iterable, List, Sequence, Tuple
+from typing import Iterable, List, Sequence, Tuple, Optional
 
 import cv2
 import numpy as np
@@ -19,16 +19,16 @@ class TemplateParams:
     base_sizes: Tuple[Tuple[int, int], ...] = ((120, 50), (50, 120))  # (w, h)
     clahe_clip_limit: float = 2.0
     clahe_tile_grid: Tuple[int, int] = (8, 8)
-    peak_min_distance: int = 3  # pixels between local maxima
+    # Peak picking controls
+    peak_min_distance: int = 3  # absolute floor (px)
+    relative_peak_distance: float = 0.35  # fraction of min(w,h) per template
+    max_peaks_per_template: int = 400  # hard cap to keep NMS fast
 
 
 # ----------------------- preprocessing ------------------------------------- #
 
 def to_gray_clahe(bgr: np.ndarray, clip: float, tile: Tuple[int, int]) -> np.ndarray:
-    """Convert BGR→GRAY and apply CLAHE to improve local contrast.
-
-    Returns uint8 image.
-    """
+    """Convert BGR→GRAY and apply CLAHE to improve local contrast (uint8)."""
     if bgr.ndim == 2:
         gray = bgr
     else:
@@ -41,25 +41,54 @@ def to_gray_clahe(bgr: np.ndarray, clip: float, tile: Tuple[int, int]) -> np.nda
 # ----------------------- template construction ----------------------------- #
 
 def _make_template(w: int, h: int) -> np.ndarray:
-    """Create a soft-edged rectangular template of size (h, w)."""
-    # base = ones with soft gaussian edge to reduce ringing
-    base = np.ones((h, w), np.float32)
-    base = cv2.GaussianBlur(base, (0, 0), sigmaX=max(w, h) * 0.05)
-    # Normalize for TM_CCOEFF_NORMED
-    base = base - base.mean()
-    denom = base.std() + 1e-6
-    base = base / denom
-    return base
+    """Mean-zero, unit-variance rectangular template with a bright core and
+    a negative ring (difference-of-rectangles), then softly blurred.
+
+    Это даёт острый максимум на прямоугольниках нужного размера и низкий отклик на фоне.
+    """
+    w = int(w); h = int(h)
+    tpl = np.zeros((h, w), np.float32)
+
+    # Внутренний яркий прямоугольник (оставим поля 8% по каждой стороне)
+    mx = max(1, int(round(0.08 * w)))
+    my = max(1, int(round(0.08 * h)))
+    core_x1, core_y1 = mx, my
+    core_x2, core_y2 = max(core_x1 + 2, w - mx - 1), max(core_y1 + 2, h - my - 1)
+
+    # Бинарные маски ядра и всего шаблона
+    core = np.zeros_like(tpl)
+    core[core_y1:core_y2, core_x1:core_x2] = 1.0
+    full = np.ones_like(tpl)
+
+    # «Кольцо» = full - core
+    ring = full - core
+
+    # Выберем веса так, чтобы среднее по tpl было нулевым: A*core + B*ring,  mean=0
+    area_core = float(core.sum())
+    area_ring = float(ring.sum())
+    if area_ring < 1:  # на всякий случай
+        area_ring = 1.0
+    A = 1.0
+    B = - area_core / area_ring  # чтобы среднее было 0
+    tpl = A * core + B * ring
+
+    # Мягкие края, чтобы избежать звонков
+    tpl = cv2.GaussianBlur(tpl, (0, 0), sigmaX=max(w, h) * 0.03)
+
+    # Нормализация (zero-mean, unit-std)
+    tpl -= tpl.mean()
+    std = tpl.std()
+    if std < 1e-6:
+        std = 1e-6
+    tpl /= std
+    return tpl
 
 
 def _build_templates(
     base_sizes: Sequence[Tuple[int, int]],
     scales: Iterable[float],
 ) -> List[Tuple[np.ndarray, int, int]]:
-    """Generate templates for all (base_size × scale).
-
-    Returns list of (template, w, h).
-    """
+    """Generate templates for all (base_size × scale). Returns (template, w, h)."""
     out: List[Tuple[np.ndarray, int, int]] = []
     for (bw, bh) in base_sizes:
         for s in scales:
@@ -72,24 +101,60 @@ def _build_templates(
 
 # ----------------------- peak picking on scoremap -------------------------- #
 
-def _find_local_maxima(score: np.ndarray, thr: float, min_dist: int) -> List[Tuple[int, int, float]]:
-    """Find local maxima ≥ thr using dilation-based NMS on the score map.
+# --- replace this function in car_detect/detection/template.py ---
 
-    Returns list of (x, y, value).
+def _find_local_maxima(
+    score: np.ndarray,
+    thr: float,
+    min_dist: int,
+    top_k: Optional[int] = None,
+) -> List[Tuple[int, int, float]]:
+    """Find unique local maxima ≥ thr on possibly flat plateaus.
+
+    Strategy:
+      1) Morphological dilation to locate regional maxima.
+      2) Build mask of points equal to dilation AND above threshold.
+      3) Connected components on that mask -> one plateau = one component.
+      4) For each component pick a single representative (argmax by score).
+      5) Sort by score desc and keep top_k if requested.
     """
     if score.size == 0:
         return []
 
-    # Dilate to get local maxima
+    # Kernel size tied to min_dist (guarantees spatial sparsity after step 4)
     k = 2 * int(max(1, min_dist)) + 1
     kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (k, k))
     dil = cv2.dilate(score, kernel)
-    peaks = (score >= thr) & (score >= dil - 1e-6)
 
-    ys, xs = np.where(peaks)
-    vals = score[ys, xs]
-    order = np.argsort(-vals)
-    return [(int(xs[i]), int(ys[i]), float(vals[i])) for i in order]
+    # Regional maxima (allow tiny epsilon to swallow FP32 noise)
+    maxima_mask = (score >= thr) & (np.abs(score - dil) <= 1e-6)
+    if not np.any(maxima_mask):
+        return []
+
+    # Connected components on 8-neighborhood
+    # OpenCV expects uint8 mask {0,1}
+    mask_u8 = maxima_mask.astype(np.uint8)
+    num, labels = cv2.connectedComponents(mask_u8, connectivity=8)
+
+    peaks: List[Tuple[int, int, float]] = []
+    # For each component (skip background 0)
+    for comp_id in range(1, num):
+        ys, xs = np.where(labels == comp_id)
+        vals = score[ys, xs]
+        # Choose argmax; if many equal, pick smallest (y,x) for determinism
+        best = np.flatnonzero(vals == vals.max())
+        idx = int(best[0])  # deterministic: the first in scanning order
+        x = int(xs[idx])
+        y = int(ys[idx])
+        v = float(score[y, x])
+        peaks.append((x, y, v))
+
+    # Sort by score desc
+    peaks.sort(key=lambda t: t[2], reverse=True)
+    if top_k is not None and len(peaks) > top_k:
+        peaks = peaks[:top_k]
+    return peaks
+
 
 
 # ----------------------- main detection ------------------------------------ #
@@ -98,42 +163,67 @@ def detect_cars_by_template(
     image_bgr: np.ndarray,
     params: TemplateParams = TemplateParams(),
     label: str = "car_tpl",
+    zscore_stats: Tuple[float, float] | None = None,  # <— НОВОЕ
 ) -> List[Detection]:
     """Detect cars via normalized template matching across scales and orientations.
 
     Steps:
       1) GRAY + CLAHE
       2) For each template (two orientations × scales): cv2.matchTemplate(TMN_CCOEFF_NORMED)
-      3) Collect local maxima ≥ threshold
-      4) Convert to boxes and run NMS
-
-    Returns
-    -------
-    List[Detection]
-        Detections with scores in [0, 1].
+      3) Collect local maxima ≥ threshold (distance depends on template size, top-K limited)
+      4) Convert to boxes, run per-template NMS
+      5) Concatenate and run global NMS
     """
     gray = to_gray_clahe(image_bgr, params.clahe_clip_limit, params.clahe_tile_grid)
-    h_img, w_img = gray.shape[:2]
+
+    # Z-score нормализация: либо глобальная (из zscore_stats), либо локальная (по текущему тайлу)
+    if zscore_stats is None:
+        m, s = float(gray.mean()), float(gray.std())
+    else:
+        m, s = zscore_stats
+    g = (gray.astype(np.float32) - m) / (s + 1e-6)
+
+    h_img, w_img = g.shape[:2]
 
     templates = _build_templates(params.base_sizes, params.scales)
-    dets: List[Detection] = []
+    all_dets: List[Detection] = []
 
     for tpl, w, h in templates:
-        # matchTemplate expects: image (float32) and template (float32)
-        # We normalize image per-template subtly by converting to float32
-        res = cv2.matchTemplate(gray.astype(np.float32), tpl, cv2.TM_CCOEFF_NORMED)
-        # res has shape (H - h + 1, W - w + 1), value in [-1, 1]
-        peaks = _find_local_maxima(res, params.threshold, params.peak_min_distance)
-        for x, y, v in peaks:
-            x1, y1, x2, y2 = float(x), float(y), float(x + w), float(y + h)
-            # Clip to image bounds just in case
-            x2 = min(x2, float(w_img - 1))
-            y2 = min(y2, float(h_img - 1))
-            dets.append(Detection(x1, y1, x2, y2, score=float(v), label=label))
+        res = cv2.matchTemplate(g, tpl, cv2.TM_CCOEFF_NORMED)
+        # Backroll: if res is NaN/Inf
+        res = np.nan_to_num(res, nan=-1.0, posinf=-1.0, neginf=-1.0)
+        # Distance tied to template size (prevents multiple peaks within one car)
+        min_dist_tpl = max(
+            int(round(min(w, h) * float(params.relative_peak_distance))),
+            int(params.peak_min_distance),
+        )
 
-    # Greedy NMS across all templates
-    dets = nms_detections(dets, params.nms_iou)
-    return dets
+        peaks = _find_local_maxima(
+            res,
+            thr=params.threshold,
+            min_dist=min_dist_tpl,
+            top_k=params.max_peaks_per_template,
+        )
+
+        # Build local detections and clip to image just in case
+        local: List[Detection] = []
+        x_max = float(w_img - 1)
+        y_max = float(h_img - 1)
+        for x, y, v in peaks:
+            x1 = float(x)
+            y1 = float(y)
+            x2 = min(float(x + w), x_max)
+            y2 = min(float(y + h), y_max)
+            local.append(Detection(x1, y1, x2, y2, score=float(v), label=label))
+
+        # Per-template NMS to shrink duplicates even before the final merge
+        if local:
+            local = nms_detections(local, params.nms_iou)
+            all_dets.extend(local)
+
+    # Global NMS across all templates/scales
+    all_dets = nms_detections(all_dets, params.nms_iou)
+    return all_dets
 
 
 # ----------------------- synthetic scene generator ------------------------- #
@@ -177,7 +267,6 @@ def generate_synthetic_scene(p: SyntheticParams = SyntheticParams()) -> Tuple[np
     rng = _rand_rng(p.seed)
     H, W = p.height, p.width
 
-    # Base background + noise
     base = np.full((H, W), p.bg_level, np.uint8)
     noise = rng.normal(0.0, p.noise_sigma, size=(H, W)).astype(np.float32)
     img = np.clip(base.astype(np.float32) + noise, 0, 255).astype(np.uint8)
@@ -188,7 +277,7 @@ def generate_synthetic_scene(p: SyntheticParams = SyntheticParams()) -> Tuple[np
         x2, y2 = x1 + w, y1 + h
         if x2 >= W - 1 or y2 >= H - 1 or x1 < 0 or y1 < 0:
             return False
-        # Light IoU constraint to avoid heavy overlaps that hurt counting
+        # Avoid heavy overlaps (IoU > 0.1)
         for gx1, gy1, gx2, gy2 in gt:
             xx1 = max(x1, gx1)
             yy1 = max(y1, gy1)
@@ -202,19 +291,14 @@ def generate_synthetic_scene(p: SyntheticParams = SyntheticParams()) -> Tuple[np
                 return False
         return True
 
-    # Place cars
     for _ in range(p.n_cars):
         orient = rng.choice(p.orientations)
         bw, bh = p.base_size
-        if orient == "h":
-            w0, h0 = bw, bh
-        else:
-            w0, h0 = bh, bw
+        w0, h0 = (bw, bh) if orient == "h" else (bh, bw)
         s = float(rng.uniform(1.0 - p.jitter_scale, 1.0 + p.jitter_scale))
         w = max(8, int(round(w0 * s)))
         h = max(8, int(round(h0 * s)))
 
-        # Try several times to find a free spot
         ok = False
         for _try in range(200):
             x1 = int(rng.integers(0, max(1, W - w - 1)))
@@ -228,7 +312,6 @@ def generate_synthetic_scene(p: SyntheticParams = SyntheticParams()) -> Tuple[np
         x2, y2 = x1 + w, y1 + h
         cv2.rectangle(img, (x1, y1), (x2, y2), color=int(p.car_level), thickness=-1, lineType=cv2.LINE_AA)
 
-        # Occasionally add a soft shadow nearby
         if rng.random() < p.shadow_prob:
             cx = int(np.clip(x1 + int(0.3 * w), 0, W - 1))
             cy = int(np.clip(y1 + int(0.7 * h), 0, H - 1))
@@ -236,6 +319,5 @@ def generate_synthetic_scene(p: SyntheticParams = SyntheticParams()) -> Tuple[np
 
         gt.append((x1, y1, x2, y2))
 
-    # Return as BGR
     bgr = cv2.cvtColor(img, cv2.COLOR_GRAY2BGR)
     return bgr, gt
