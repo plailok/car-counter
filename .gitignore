@@ -1,0 +1,61 @@
+# Python cache / builds
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.so
+.build/
+build/
+dist/
+*.egg-info/
+.eggs/
+
+# Virtual envs
+.venv/
+venv/
+env/
+ENV/
+
+# IDE / editor
+.vscode/
+.idea/
+*.iml
+
+# OS junk
+.DS_Store
+Thumbs.db
+
+# Tests / coverage
+.pytest_cache/
+.coverage
+.coverage.*
+htmlcov/
+.cache/
+.tox/
+.mypy_cache/
+*.log
+
+# Not for GitHub repo
+# (big artifacts, datasets, generated images, exports)
+data/
+datasets/
+results/
+outputs/
+exports/
+*.csv
+*.pt
+*.onnx
+*.weights
+*.zip
+*.7z
+*.tar
+*.tar.gz
+*.tiff
+*.tif
+*.bmp
+*.png
+*.jpg
+*.jpeg
+
+# Ultralytics weights (will be optional in Step 3)
+runs/
