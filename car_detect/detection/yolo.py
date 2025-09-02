@@ -7,6 +7,19 @@ from typing import Iterable, List, Optional, Sequence, Tuple
 import numpy as np
 
 from .types import Detection
+import sys, os
+
+def resource_path(rel_path: str) -> str:
+    if hasattr(sys, "_MEIPASS"):
+        return os.path.join(sys._MEIPASS, rel_path)
+    return os.path.join(os.path.abspath("."), rel_path)
+
+WEIGHTS = {
+    "n": resource_path("models/yolov8n.pt"),
+    "m": resource_path("models/yolov8m.pt"),
+    "x": resource_path("models/yolov8x.pt"),
+}
+
 
 logger = logging.getLogger(__name__)
 

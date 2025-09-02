@@ -23,7 +23,12 @@ class TemplateParams:
     peak_min_distance: int = 3  # absolute floor (px)
     relative_peak_distance: float = 0.35  # fraction of min(w,h) per template
     max_peaks_per_template: int = 400  # hard cap to keep NMS fast
-
+    min_std: float = 14.0  # минимальная σ яркости внутри бокса (uint8)
+    edge_grad_thresh: float = 40.0  # порог по модулю градиента (Sobel)
+    min_edge_density: float = 0.03  # доля пикселей с |grad|>thr внутри бокса
+    polarity: str = "both"  # "bright" | "dark" | "both"
+    use_edge_channel: bool = True  # матчить по градиентной карте вместо яркости
+    edge_ksize: int = 3
 
 # ----------------------- preprocessing ------------------------------------- #
 
@@ -37,6 +42,21 @@ def to_gray_clahe(bgr: np.ndarray, clip: float, tile: Tuple[int, int]) -> np.nda
     out = clahe.apply(gray)
     return out
 
+def _passes_texture_filters(patch_gray: np.ndarray, p: TemplateParams) -> bool:
+    """Heuristics on CLAHE-gray (uint8/float32 in 0..255)."""
+    if patch_gray.size == 0:
+        return False
+
+    # std в шкале интенсивности изображения
+    if float(patch_gray.std()) < float(p.min_std):
+        return False
+
+    # edge density по модулю градиента Sobel
+    gx = cv2.Sobel(patch_gray, cv2.CV_32F, 1, 0, ksize=3)
+    gy = cv2.Sobel(patch_gray, cv2.CV_32F, 0, 1, ksize=3)
+    mag = cv2.magnitude(gx, gy)
+    dens = float((mag > float(p.edge_grad_thresh)).mean())
+    return dens >= float(p.min_edge_density)
 
 # ----------------------- template construction ----------------------------- #
 
@@ -182,6 +202,15 @@ def detect_cars_by_template(
     else:
         m, s = zscore_stats
     g = (gray.astype(np.float32) - m) / (s + 1e-6)
+    if params.use_edge_channel:
+        k = int(max(1, params.edge_ksize))
+        gx = cv2.Sobel(gray, cv2.CV_32F, 1, 0, ksize=k)
+        gy = cv2.Sobel(gray, cv2.CV_32F, 0, 1, ksize=k)
+        mag = cv2.magnitude(gx, gy)
+        em = (mag - mag.mean()) / (mag.std() + 1e-6)
+        channel = em
+    else:
+        channel = g
 
     h_img, w_img = g.shape[:2]
 
@@ -189,7 +218,18 @@ def detect_cars_by_template(
     all_dets: List[Detection] = []
 
     for tpl, w, h in templates:
-        res = cv2.matchTemplate(g, tpl, cv2.TM_CCOEFF_NORMED)
+        res_pos = cv2.matchTemplate(channel, tpl, cv2.TM_CCOEFF_NORMED)
+        res_pos = np.nan_to_num(res_pos, nan=-1.0, posinf=-1.0, neginf=-1.0)
+
+        if params.polarity == "bright":
+            res = res_pos
+        elif params.polarity == "dark":
+            res_neg = cv2.matchTemplate(channel, -tpl, cv2.TM_CCOEFF_NORMED)
+            res = np.nan_to_num(res_neg, nan=-1.0, posinf=-1.0, neginf=-1.0)
+        else:  # "both"
+            res_neg = cv2.matchTemplate(channel, -tpl, cv2.TM_CCOEFF_NORMED)
+            res_neg = np.nan_to_num(res_neg, nan=-1.0, posinf=-1.0, neginf=-1.0)
+            res = np.maximum(res_pos, res_neg)
         # Backroll: if res is NaN/Inf
         res = np.nan_to_num(res, nan=-1.0, posinf=-1.0, neginf=-1.0)
         # Distance tied to template size (prevents multiple peaks within one car)
@@ -212,8 +252,21 @@ def detect_cars_by_template(
         for x, y, v in peaks:
             x1 = float(x)
             y1 = float(y)
-            x2 = min(float(x + w), x_max)
-            y2 = min(float(y + h), y_max)
+            x2 = min(float(x + w), float(w_img))
+            y2 = min(float(y + h), float(h_img))
+
+            # индексы для слайса: floor начала, ceil конца (y2/x2 эксклюзивны)
+            xi1 = max(0, int(np.floor(x1)));
+            yi1 = max(0, int(np.floor(y1)))
+            xi2 = min(w_img, int(np.ceil(x2)));
+            yi2 = min(h_img, int(np.ceil(y2)))
+            if xi2 - xi1 < 6 or yi2 - yi1 < 6:
+                continue
+
+            patch_gray = gray[yi1:yi2, xi1:xi2]
+            if not _passes_texture_filters(patch_gray, params):
+                continue
+
             local.append(Detection(x1, y1, x2, y2, score=float(v), label=label))
 
         # Per-template NMS to shrink duplicates even before the final merge
