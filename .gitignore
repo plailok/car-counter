@@ -56,5 +56,9 @@ exports/
 *.jpg
 *.jpeg
 
-# Ultralytics weights (will be optional in Step 3)
+*.egg-info/
+dist/
+build/
+__pycache__/
+
 runs/
