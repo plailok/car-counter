@@ -14,7 +14,9 @@ from PySide6.QtWidgets import (
 )
 from PySide6.QtCore import Qt, QRectF, QSize, QPointF
 from PySide6.QtGui import QAction, QPainter, QPen, QPixmap, QImage, QWheelEvent, QMouseEvent, QKeyEvent, QActionGroup
-
+from PySide6.QtWidgets import QToolBar, QMenu
+from car_detect.ui.autotune_dialog import AutoTuneDialog, YoloWeightOption
+from car_detect.detection.yolo import resource_path
 from .ui.car_detection_panel import CarDetectionPanel
 from .detection.config import PipelineConfig
 from .detection.template import detect_cars_by_template, to_gray_clahe
@@ -363,9 +365,36 @@ class MainWindow(QMainWindow):
         # Toolbar
         self._create_toolbar()
 
+        self._create_tools_menu()
+
         self.statusBar().showMessage("Ready")
 
         self._limit_to_roi: bool = False
+
+    def _create_tools_menu(self) -> None:
+        tools = self.menuBar().addMenu("&Tools")
+        act_autotune = QAction("Auto-Tuner (YOLO)…", self)
+        act_autotune.triggered.connect(self._open_autotune)
+        tools.addAction(act_autotune)
+
+    def _open_autotune(self) -> None:
+        # предложим 3 веса (n/m/x); можно подменить путями из ресурсов/папки models
+        weights = [
+            YoloWeightOption("yolov8n.pt", resource_path("models/yolov8n.pt")),
+            YoloWeightOption("yolov8m.pt", resource_path("models/yolov8m.pt")),
+            YoloWeightOption("yolov8x.pt", resource_path("models/yolov8x.pt")),
+        ]
+        dlg = AutoTuneDialog(weights, self)
+        dlg.applyParams.connect(self._apply_yolo_from_autotune)
+        dlg.exec()
+
+    def _apply_yolo_from_autotune(self, conf: float, iou: float, imgsz: int) -> None:
+        # Перекидываем параметры в правую панель (если есть поля YOLO)
+        self.panel.cb_backend.setCurrentText("yolo")
+        self.panel.sp_yolo_conf.setValue(conf)
+        self.panel.sp_yolo_iou.setValue(iou)
+        self.panel.sp_yolo_imgsz.setValue(imgsz)
+        self.statusBar().showMessage(f"Auto-Tuner applied: conf={conf:.2f}, iou={iou:.2f}, imgsz={imgsz}")
 
     def _create_right_dock(self) -> None:
         dock = QDockWidget("Car Detection", self)

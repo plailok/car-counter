@@ -30,6 +30,10 @@ class Detection:
     score: float
     label: str = "car"
 
+    angle: Optional[float] = None      # degrees, image coords, -90..90 (0 = горизонталь)
+    r_width: Optional[float] = None    # width along principal axis (rotated box)
+    r_height: Optional[float] = None   # height along principal axis
+
     # ---- geometry helpers -------------------------------------------------
     @property
     def width(self) -> float:
