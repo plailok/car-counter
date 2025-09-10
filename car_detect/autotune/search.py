@@ -10,7 +10,13 @@ import cv2
 import numpy as np
 
 from car_detect.detection.types import Detection
-from car_detect.detection.yolo import detect_cars_by_yolo, YOLOParams, YoloNotAvailableError
+from car_detect.detection.yolo import detect_cars_by_yolo, YOLOParams, YoloNotAvailableError, _load_yolo
+from car_detect.utils.io import safe_imread
+from car_detect.utils.io import safe_imread_first_frame
+
+import logging
+log = logging.getLogger("car_counter.autotune")
+
 
 
 @dataclass(frozen=True)
@@ -116,13 +122,18 @@ def run_autotune(
     max_workers: int = max(1, cv2.getNumberOfCPUs() // 2),
 ) -> List[TrialResult]:
     """Параллельный перебор по всем изображениям и сетке параметров."""
+    log.info("Auto-Tune start: %d images, grid conf=%s iou=%s imgsz=%s",
+             len(images), spec.conf_list, spec.iou_list, spec.imgsz_list)
     results: List[TrialResult] = []
     tasks: List[Tuple[TrialParams, ImageTask]] = []
+    _ = _load_yolo(spec.weights_path)
+    if max_workers is None:
+        max_workers = 1
 
     for img_task in images:
         # загрузка
         if img_task.bgr is None:
-            bgr = cv2.imread(str(img_task.path), cv2.IMREAD_COLOR)
+            bgr = safe_imread_first_frame(img_task.path)
             if bgr is None:
                 continue
         else:
@@ -149,6 +160,8 @@ def run_autotune(
                     r = fut.result()
                     r.image_path = it.path
                     results.append(r)
+                    log.info("Trial: %s conf=%.2f iou=%.2f sz=%d -> n=%d pass=%.1f%% time=%.0fms",
+                             it.path.name, tp.conf, tp.iou, tp.imgsz, r.n, 100 * r.pass_ratio, r.runtime_ms)
                 except YoloNotAvailableError:
                     raise
                 except Exception as e:

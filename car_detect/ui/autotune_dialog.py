@@ -152,12 +152,23 @@ class AutoTuneDialog(QDialog):
 
     def _on_run(self) -> None:
         if len(self._images) < 2:
-            QMessageBox.information(self, "Auto-Tuner", "Please add at least two images."); return
+            QMessageBox.information(self, "Auto-Tuner", "Please add at least two images.");
+            return
+
+        self.btn_run.setEnabled(False)
+        self.tbl.setRowCount(0)
+        self.lbl_preview.setText("Running…")
         spec = self._spec()
         try:
-            self._results = run_autotune(self._images, spec)
-        except YoloNotAvailableError as e:
-            QMessageBox.warning(self, "YOLO", str(e)); return
+            self._results = run_autotune(self._images, spec)  # теперь надёжнее
+        except KeyboardInterrupt:
+            QMessageBox.warning(self, "Auto-Tuner", "Interrupted by user.")
+            self._results = []
+        except Exception as e:
+            QMessageBox.critical(self, "Auto-Tuner", f"Failed: {type(e).__name__}: {e}")
+            self._results = []
+        finally:
+            self.btn_run.setEnabled(True)
 
         # fill table
         self.tbl.setRowCount(0)
@@ -179,17 +190,21 @@ class AutoTuneDialog(QDialog):
 
     def _on_select_row(self) -> None:
         rows = self.tbl.selectionModel().selectedRows()
-        if not rows:
+        if not rows or not self._results:
             return
         idx = rows[0].row()
-        if 0 <= idx < len(self._results):
-            self._show_preview(self._results[idx])
+        if idx < 0 or idx >= len(self._results):
+            return
+        self._show_preview(self._results[idx])
 
     def _show_preview(self, r: TrialResult) -> None:
         # reload image if necessary
-        bgr = cv2.imread(str(r.image_path), cv2.IMREAD_COLOR)
+        from car_detect.utils.io import safe_imread_first_frame
+        bgr = safe_imread_first_frame(r.image_path)
         if bgr is None:
-            self.lbl_preview.setText("Failed to load image."); return
+            self.lbl_preview.setText("Failed to load image (TIFF/unsupported).")
+            return
+
         qi = _cv_to_qimage(bgr)
         pm = QPixmap.fromImage(qi)
         # draw boxes
